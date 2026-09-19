@@ -1,0 +1,25 @@
+name: Publish
+
+on:
+  release:
+    types: [created]
+
+jobs:
+  publish-npm:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm it
+      - run: npm run minify
+      - run: npm version ${TAG_NAME} --git-tag-version=false
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
+      - run: npm --ignore-scripts publish --provenance --access public

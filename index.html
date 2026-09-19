@@ -1,0 +1,129 @@
+<!doctype html>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Custom Attributes polyfill</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 44em; margin: 2em auto; padding: 0 1em; color: #222; }
+  pre { background: #f4f4f4; padding: 1em; overflow: auto; }
+  code { font-size: 0.95em; }
+  nav a { margin-right: 1em; }
+  .status { padding: 0.5em 1em; border-left: 4px solid gray; background: #f9f9f9; }
+  .status[data-state="native"] { border-color: green; }
+  .status[data-state="polyfilled"] { border-color: orange; }
+  .status[data-state="none"] { border-color: red; }
+  table { border-collapse: collapse; }
+  td, th { text-align: left; padding: 0.25em 0.75em; border-bottom: 1px solid #ddd; vertical-align: top; }
+</style>
+
+<h1>Custom Attributes polyfill</h1>
+
+<nav>
+  <a href="example.html">Live example</a>
+  <a href="test.html">Tests</a>
+  <a href="https://github.com/keithamus/project-custom-attributes/blob/main/EXPLAINER.md">Explainer</a>
+  <a href="https://github.com/keithamus/project-custom-attributes/blob/main/README.md">Motivation and design</a>
+  <a href="https://github.com/keithamus/custom-attributes-polyfill">Source</a>
+</nav>
+
+<p class="status" id="status">Checking support...</p>
+
+<h2>What is this?</h2>
+
+<p>
+  Custom Attributes are "Custom Elements, but for attributes". You subclass
+  <code>Attr</code>, register it under a hyphenated name, and every matching
+  attribute on a connected element is upgraded in place to an instance of your
+  class, with lifecycle callbacks mirroring custom elements. Where a custom
+  element models what an element <em>is</em>, a custom attribute models a
+  behaviour an element <em>has</em>, and can be applied to any element: HTML,
+  SVG, MathML, or another custom element.
+</p>
+
+<pre><code>class PersistValue extends Attr {
+  connectedCallback() {
+    const stored = localStorage.getItem(this.value);
+    if (stored !== null) this.ownerElement.value = stored;
+    this.ownerElement.addEventListener("input", this);
+  }
+
+  disconnectedCallback() {
+    this.ownerElement.removeEventListener("input", this);
+  }
+
+  attributeChangedCallback(oldValue, newValue) {
+    if (oldValue !== null) localStorage.removeItem(oldValue);
+  }
+
+  handleEvent() {
+    localStorage.setItem(this.value, this.ownerElement.value);
+  }
+}
+
+customAttributes.define("persist-value", PersistValue);</code></pre>
+
+<pre><code>&lt;input name="email" persist-value="email-draft" /&gt;
+&lt;textarea name="bio" persist-value="bio-draft"&gt;&lt;/textarea&gt;</code></pre>
+
+<p>
+  <code>el.getAttributeNode("persist-value")</code> and
+  <code>el.attributes["persist-value"]</code> return the
+  <code>PersistValue</code> instance, so methods added to the class live on the
+  attribute node and never clash with element API.
+</p>
+
+<h2>Lifecycle callbacks</h2>
+
+<table>
+  <tr><th>Callback</th><th>Runs when</th></tr>
+  <tr><td><code>constructor()</code></td><td>the attribute is upgraded, constructed directly, or created by <code>document.createAttribute()</code></td></tr>
+  <tr><td><code>attributeChangedCallback(oldValue, newValue)</code></td><td>the value is added, changed or removed; once on upgrade with its initial value</td></tr>
+  <tr><td><code>connectedCallback()</code></td><td>added to a connected element, or its element is inserted into a document</td></tr>
+  <tr><td><code>disconnectedCallback()</code></td><td>removed from a connected element, or its element is removed</td></tr>
+  <tr><td><code>connectedMoveCallback()</code></td><td>its element is moved with <code>moveBefore()</code></td></tr>
+  <tr><td><code>adoptedCallback(oldDocument, newDocument)</code></td><td>its element is adopted into another document</td></tr>
+</table>
+
+<h2>Using the polyfill</h2>
+
+<pre><code>import "custom-attributes-polyfill";</code></pre>
+
+<p>Or apply it manually:</p>
+
+<pre><code>import { isSupported, apply } from "custom-attributes-polyfill/fn";
+if (!isSupported()) apply();</code></pre>
+
+<p>
+  The polyfill covers <code>window.customAttributes</code>,
+  <code>CustomAttributeRegistry</code> (including scoped registries for shadow
+  trees), the <code>Attr</code> constructor,
+  <code>document.createAttribute()</code>, and the
+  <code>customAttributeRegistry</code> option on <code>createElement()</code>,
+  <code>importNode()</code>, <code>attachShadow()</code> and
+  <code>setHTMLUnsafe()</code>.
+</p>
+
+<h2>Limitations</h2>
+
+<ul>
+  <li>Reactions run at the next microtask checkpoint, not synchronously at the end of the DOM operation. <code>define()</code>, <code>upgrade()</code>, <code>initialize()</code> and <code>createAttribute()</code> are synchronous.</li>
+  <li>An element removed and re-inserted within the same task keeps its attributes connected; no <code>disconnectedCallback</code>/<code>connectedCallback</code> pair fires.</li>
+  <li>Only <code>document</code>, shadow roots, and documents passed to <code>initialize()</code> are observed.</li>
+  <li>An element's registry is fixed the first time the polyfill needs it rather than at creation; <code>cloneNode()</code> does not copy it.</li>
+</ul>
+
+<p>See the <a href="README.md">README</a> for the full list.</p>
+
+<script type="module">
+  import { isSupported, isPolyfilled, apply } from "./custom-attributes.js";
+  const status = document.getElementById("status");
+  if (isSupported()) {
+    status.dataset.state = "native";
+    status.textContent = "This browser supports Custom Attributes natively. The polyfill is not needed.";
+  } else {
+    apply();
+    status.dataset.state = isPolyfilled() ? "polyfilled" : "none";
+    status.textContent = isPolyfilled()
+      ? "This browser does not support Custom Attributes natively; the polyfill has been applied on this page."
+      : "The polyfill could not be applied in this browser.";
+  }
+</script>

@@ -1,0 +1,518 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>custom-attributes-polyfill tests</title>
+<style>
+  body { font: 14px/1.4 system-ui, sans-serif; }
+  .pass { color: green; }
+  .fail { color: red; }
+</style>
+<div id="fixture" hidden>
+  <p id="parsed" x-parsed="from markup">parsed</p>
+  <p id="parsed-later" x-later="late">parsed</p>
+</div>
+<ol id="log"></ol>
+<script type="module">
+  import { apply, isSupported, isPolyfilled } from "./custom-attributes.js";
+  if (!isSupported()) apply();
+
+  const tick = async () => { await null; await null; };
+  const log = document.getElementById("log");
+  const fixture = document.getElementById("fixture");
+  const results = (window.results = { pass: 0, fail: 0, failures: [] });
+  const tests = [];
+  const test = (name, fn) => tests.push({ name, fn });
+  const assert = (cond, msg) => {
+    if (!cond) throw new Error(msg || "assertion failed");
+  };
+  const eq = (a, b, msg) =>
+    assert(
+      JSON.stringify(a) === JSON.stringify(b),
+      `${msg || "equal"}: expected ${JSON.stringify(b)}, got ${JSON.stringify(a)}`,
+    );
+  const throws = (fn, check, msg) => {
+    try {
+      fn();
+    } catch (e) {
+      assert(check(e), `${msg || "throws"}: wrong error ${e}`);
+      return;
+    }
+    throw new Error(`${msg || "throws"}: did not throw`);
+  };
+  const isDOMException = (name) => (e) => e instanceof DOMException && e.name === name;
+  const isTypeError = (e) => e instanceof TypeError;
+  let counter = 0;
+  const uniqueName = (prefix = "x-t") => `${prefix}${++counter}`;
+  const recording = () => {
+    const calls = [];
+    class Recorder extends Attr {
+      constructor() {
+        super();
+        calls.push(["constructor", this.ownerElement?.id ?? null, this.value]);
+      }
+      connectedCallback() { calls.push(["connected"]); }
+      disconnectedCallback() { calls.push(["disconnected"]); }
+      attributeChangedCallback(oldValue, newValue) { calls.push(["changed", oldValue, newValue]); }
+      adoptedCallback(oldDocument, newDocument) { calls.push(["adopted", oldDocument !== newDocument]); }
+    }
+    return { calls, Recorder };
+  };
+  const mount = (html) => {
+    const div = document.createElement("div");
+    div.innerHTML = html;
+    fixture.append(div);
+    return div;
+  };
+
+  test("feature detection", () => {
+    assert(isSupported(), "isSupported after apply");
+    assert(isPolyfilled(), "isPolyfilled");
+    assert(customAttributes instanceof CustomAttributeRegistry);
+    eq(document.customAttributeRegistry === customAttributes, true, "document registry");
+    eq(String(customAttributes), "[object CustomAttributeRegistry]");
+  });
+
+  test("define() validation", () => {
+    throws(() => customAttributes.define("x-nope", {}), isTypeError, "non-constructor");
+    throws(() => customAttributes.define("x-nope", () => {}), isTypeError, "arrow fn");
+    for (const bad of ["nohyphen", "X-upper", "x-Upper", "data-x", "aria-x", "xml-x", "xlink-x", "accept-charset", "http-equiv", "1-x", "-x", "x-=y", "x y"]) {
+      throws(() => customAttributes.define(bad, class extends Attr {}), isDOMException("SyntaxError"), bad);
+    }
+    class A extends Attr {}
+    const name = uniqueName();
+    customAttributes.define(name, A);
+    throws(() => customAttributes.define(name, class extends Attr {}), isDOMException("NotSupportedError"), "dup name");
+    throws(() => customAttributes.define(uniqueName(), A), isDOMException("NotSupportedError"), "dup ctor");
+    const badPrototype = function () {};
+    badPrototype.prototype = 1;
+    throws(() => customAttributes.define(uniqueName(), badPrototype), isTypeError, "bad prototype");
+    throws(() => customAttributes.define(uniqueName(), class extends Attr { connectedCallback = 1; static { this.prototype.connectedCallback = 1; } }), isTypeError, "non-callable callback");
+  });
+
+  test("get(), getName(), whenDefined()", async () => {
+    const name = uniqueName();
+    class A extends Attr {}
+    eq(customAttributes.get(name), undefined);
+    eq(customAttributes.getName(A), null);
+    const pending = customAttributes.whenDefined(name);
+    customAttributes.define(name, A);
+    eq(customAttributes.get(name) === A, true);
+    eq(customAttributes.getName(A), name);
+    eq((await pending) === A, true, "pending resolves");
+    eq((await customAttributes.whenDefined(name)) === A, true, "already defined");
+    await customAttributes.whenDefined("bad").then(
+      () => assert(false, "should reject"),
+      (e) => assert(isDOMException("SyntaxError")(e)),
+    );
+  });
+
+  test("define() upgrades parsed attributes in place, in order", () => {
+    const { calls, Recorder } = recording();
+    const el = document.getElementById("parsed");
+    const before = el.getAttributeNode("x-parsed");
+    assert(!(before instanceof Recorder));
+    customAttributes.define("x-parsed", Recorder);
+    const after = el.getAttributeNode("x-parsed");
+    eq(after === before, true, "same node");
+    assert(after instanceof Recorder, "upgraded");
+    assert(after instanceof Attr, "still an Attr");
+    eq(after.constructor === Recorder, true);
+    eq(calls, [["constructor", "parsed", "from markup"], ["changed", null, "from markup"], ["connected"]]);
+  });
+
+  test("setAttribute() on a connected element upgrades", async () => {
+    const { calls, Recorder } = recording();
+    const name = uniqueName();
+    customAttributes.define(name, Recorder);
+    const el = mount("<span id=sa></span>").firstChild;
+    el.setAttribute(name, "v");
+    eq(calls, [], "not synchronous");
+    await tick();
+    eq(calls, [["constructor", "sa", "v"], ["changed", null, "v"], ["connected"]]);
+    assert(el.getAttributeNode(name) instanceof Recorder);
+  });
+
+  test("value changes and removal", async () => {
+    const { calls, Recorder } = recording();
+    const name = uniqueName();
+    customAttributes.define(name, Recorder);
+    const el = mount(`<span id=vc ${name}="a"></span>`).firstChild;
+    await tick();
+    calls.length = 0;
+    el.setAttribute(name, "b");
+    await tick();
+    eq(calls, [["changed", "a", "b"]], "change");
+    calls.length = 0;
+    const node = el.getAttributeNode(name);
+    node.value = "c";
+    await tick();
+    eq(calls, [["changed", "b", "c"]], "Attr.value setter");
+    calls.length = 0;
+    el.removeAttribute(name);
+    await tick();
+    eq(calls, [["changed", "c", null], ["disconnected"]], "removal");
+    eq(node.ownerElement, null);
+    calls.length = 0;
+    el.setAttributeNode(node);
+    await tick();
+    eq(calls, [["changed", null, "c"], ["connected"]], "re-attach existing custom node");
+  });
+
+  test("same-tick changes report intermediate values", async () => {
+    const { calls, Recorder } = recording();
+    const name = uniqueName();
+    customAttributes.define(name, Recorder);
+    const el = mount("<span id=st></span>").firstChild;
+    el.setAttribute(name, "1");
+    el.setAttribute(name, "2");
+    el.setAttribute(name, "3");
+    await tick();
+    eq(calls, [["constructor", "st", "3"], ["changed", null, "1"], ["connected"], ["changed", "1", "2"], ["changed", "2", "3"]]);
+  });
+
+  test("element removal and re-insertion", async () => {
+    const { calls, Recorder } = recording();
+    const name = uniqueName();
+    customAttributes.define(name, Recorder);
+    const wrap = mount(`<span id=rm ${name}></span>`);
+    const el = wrap.firstChild;
+    await tick();
+    calls.length = 0;
+    el.remove();
+    await tick();
+    eq(calls, [["disconnected"]]);
+    calls.length = 0;
+    el.setAttribute(name, "while detached");
+    await tick();
+    eq(calls, [["changed", "", "while detached"]], "changes on detached custom attributes still fire");
+    calls.length = 0;
+    wrap.append(el);
+    await tick();
+    eq(calls, [["connected"]]);
+  });
+
+  test("disconnected elements are not upgraded until connected or upgrade()", async () => {
+    const { calls, Recorder } = recording();
+    const name = uniqueName();
+    customAttributes.define(name, Recorder);
+    const el = document.createElement("i");
+    el.id = "dc";
+    el.setAttribute(name, "x");
+    await tick();
+    assert(!(el.getAttributeNode(name) instanceof Recorder), "not upgraded while detached");
+    customAttributes.upgrade(el);
+    assert(el.getAttributeNode(name) instanceof Recorder, "upgrade()");
+    eq(calls, [["constructor", "dc", "x"], ["changed", null, "x"]]);
+    calls.length = 0;
+    fixture.append(el);
+    await tick();
+    eq(calls, [["connected"]]);
+    const other = document.createElement("i");
+    other.id = "dc2";
+    other.setAttribute(name, "y");
+    fixture.append(other);
+    await tick();
+    eq(calls, [["connected"], ["constructor", "dc2", "y"], ["changed", null, "y"], ["connected"]], "upgraded on insertion");
+  });
+
+  test("innerHTML and nested subtrees upgrade", async () => {
+    const { calls, Recorder } = recording();
+    const name = uniqueName();
+    customAttributes.define(name, Recorder);
+    const wrap = mount("<div></div>").firstChild;
+    wrap.innerHTML = `<div><b id=deep ${name}="deep"></b></div>`;
+    await tick();
+    eq(calls, [["constructor", "deep", "deep"], ["changed", null, "deep"], ["connected"]]);
+  });
+
+  test("Attr constructor", async () => {
+    const { calls, Recorder } = recording();
+    const name = uniqueName();
+    throws(() => new Attr(), isTypeError, "new Attr()");
+    throws(() => new Recorder(), isTypeError, "undefined class");
+    throws(() => Attr(), isTypeError, "call without new");
+    customAttributes.define(name, Recorder);
+    const attr = new Recorder();
+    assert(attr instanceof Recorder && attr instanceof Attr);
+    eq(attr.localName, name);
+    eq(attr.namespaceURI, null);
+    eq(attr.value, "");
+    eq(attr.ownerElement, null);
+    eq(attr.ownerDocument === document, true);
+    eq(calls, [["constructor", null, ""]]);
+    calls.length = 0;
+    attr.value = "set while detached";
+    const el = mount("<span id=ac></span>").firstChild;
+    el.setAttributeNode(attr);
+    await tick();
+    eq(calls, [["changed", null, "set while detached"], ["connected"]]);
+    eq(el.getAttribute(name), "set while detached");
+    class Sub extends Recorder {}
+    throws(() => new Sub(), isTypeError, "subclass of defined class is not defined");
+  });
+
+  test("document.createAttribute() constructs synchronously", () => {
+    const { calls, Recorder } = recording();
+    const name = uniqueName();
+    customAttributes.define(name, Recorder);
+    const attr = document.createAttribute(name);
+    assert(attr instanceof Recorder);
+    eq(calls, [["constructor", null, ""]]);
+    const plain = document.createAttribute(uniqueName());
+    eq(plain.constructor === Attr, true);
+    assert(!(plain instanceof Recorder));
+    class Throws extends Attr {
+      constructor() { super(); throw new Error("boom"); }
+    }
+    const bad = uniqueName();
+    customAttributes.define(bad, Throws);
+    throws(() => document.createAttribute(bad), (e) => e.message === "boom", "rethrows");
+  });
+
+  test("constructor failure marks the attribute failed forever", async () => {
+    const calls = [];
+    let constructed = 0;
+    class Failing extends Attr {
+      constructor() { super(); constructed++; throw new Error("nope"); }
+      attributeChangedCallback(...args) { calls.push(args); }
+      connectedCallback() { calls.push("connected"); }
+    }
+    class Wrong extends Attr {
+      constructor() { super(); return document.createAttribute("x-wrong"); }
+    }
+    const name = uniqueName();
+    const wrongName = uniqueName();
+    const el = mount(`<span ${name}="a" ${wrongName}="b"></span>`).firstChild;
+    const errors = [];
+    const onError = (e) => { errors.push(e.error ?? e.message); e.preventDefault(); };
+    window.addEventListener("error", onError);
+    customAttributes.define(name, Failing);
+    customAttributes.define(wrongName, Wrong);
+    window.removeEventListener("error", onError);
+    eq(errors.length, 2, "reported");
+    eq(errors.map((e) => e.constructor.name), ["Error", "TypeError"]);
+    eq(constructed, 1);
+    el.setAttribute(name, "b");
+    await tick();
+    eq(calls, [], "no callbacks after failure");
+    customAttributes.upgrade(el);
+    el.remove();
+    fixture.append(el);
+    await tick();
+    eq(constructed, 1, "never retried");
+    eq(calls, []);
+  });
+
+  test("scoped registries in shadow trees", async () => {
+    const name = uniqueName();
+    class Global extends Attr {}
+    class Scoped extends Attr {}
+    customAttributes.define(name, Global);
+    const registry = new CustomAttributeRegistry();
+    registry.define(name, Scoped);
+    const host = mount("<div></div>").firstChild;
+    const shadow = host.attachShadow({ mode: "open", customAttributeRegistry: registry });
+    eq(shadow.customAttributeRegistry === registry, true);
+    shadow.innerHTML = `<span ${name}></span>`;
+    host.setAttribute(name, "");
+    await tick();
+    assert(shadow.firstChild.getAttributeNode(name) instanceof Scoped, "shadow uses scoped");
+    eq(shadow.firstChild.customAttributeRegistry === registry, true);
+    assert(host.getAttributeNode(name) instanceof Global, "light uses global");
+    eq(host.customAttributeRegistry === customAttributes, true);
+    const plain = mount("<div></div>").firstChild.attachShadow({ mode: "open" });
+    eq(plain.customAttributeRegistry === customAttributes, true, "default shadow registry is the document's");
+    const later = uniqueName();
+    shadow.innerHTML = `<span ${later}></span>`;
+    await tick();
+    class ScopedLater extends Attr {}
+    registry.define(later, ScopedLater);
+    assert(shadow.firstChild.getAttributeNode(later) instanceof ScopedLater, "define() on scoped registry upgrades shadow content");
+    throws(() => new ScopedLater(), isTypeError, "scoped class cannot be constructed directly");
+    const closedHost = mount("<div></div>").firstChild;
+    const closed = closedHost.attachShadow({ mode: "closed", customAttributeRegistry: registry });
+    closed.innerHTML = `<span ${later}></span>`;
+    await tick();
+    assert(closed.firstChild.getAttributeNode(later) instanceof ScopedLater, "closed shadow root");
+  });
+
+  test("createElement(), importNode(), setHTMLUnsafe() options", async () => {
+    const name = uniqueName();
+    class Global extends Attr {}
+    class Scoped extends Attr {}
+    customAttributes.define(name, Global);
+    const registry = new CustomAttributeRegistry();
+    registry.define(name, Scoped);
+    const el = document.createElement("div", { customAttributeRegistry: registry });
+    eq(el.customAttributeRegistry === registry, true);
+    eq(document.createElement("div").customAttributeRegistry === customAttributes, true);
+    eq(document.createElement("div", { customAttributeRegistry: customAttributes }).customAttributeRegistry === customAttributes, true);
+    throws(() => document.createElement("div", { customAttributeRegistry: {} }), isTypeError);
+    const foreign = document.implementation.createHTMLDocument("");
+    throws(() => foreign.createElement("div", { customAttributeRegistry: customAttributes }), isDOMException("NotSupportedError"), "global registry in another document");
+    eq(foreign.createElement("div").customAttributeRegistry, null);
+    el.setAttribute(name, "");
+    fixture.append(el);
+    await tick();
+    assert(el.getAttributeNode(name) instanceof Scoped, "createElement registry sticks");
+    const template = document.createElement("template");
+    template.innerHTML = `<b ${name}></b>`;
+    eq(template.content.firstChild.customAttributeRegistry, null, "template content has no registry");
+    const imported = document.importNode(template.content, { customAttributeRegistry: registry });
+    eq(imported.firstChild.customAttributeRegistry === registry, true);
+    fixture.append(imported);
+    const cloned = template.content.cloneNode(true);
+    fixture.append(cloned);
+    await tick();
+    assert(fixture.lastChild.getAttributeNode(name) instanceof Global, "plain clone resolves to global");
+    if (Element.prototype.setHTMLUnsafe) {
+      const box = mount("<div></div>").firstChild;
+      box.setHTMLUnsafe(`<i ${name}></i>`, { customAttributeRegistry: registry });
+      await tick();
+      assert(box.firstChild.getAttributeNode(name) instanceof Scoped, "setHTMLUnsafe");
+    }
+  });
+
+  test("initialize() on a parsed document", () => {
+    const name = uniqueName();
+    class Scoped extends Attr {}
+    const registry = new CustomAttributeRegistry();
+    registry.define(name, Scoped);
+    const doc = new DOMParser().parseFromString(`<p ${name}="1"></p>`, "text/html");
+    eq(doc.customAttributeRegistry, null);
+    eq(doc.body.customAttributeRegistry, null);
+    registry.initialize(doc);
+    eq(doc.customAttributeRegistry === registry, true);
+    eq(doc.body.customAttributeRegistry === registry, true);
+    assert(doc.querySelector("p").getAttributeNode(name) instanceof Scoped);
+    throws(() => customAttributes.initialize(doc), isDOMException("NotSupportedError"));
+    throws(() => customAttributes.initialize(doc.body), isDOMException("NotSupportedError"));
+    customAttributes.initialize(fixture);
+  });
+
+  test("namespaced attributes are never custom", async () => {
+    const { calls, Recorder } = recording();
+    const name = uniqueName();
+    customAttributes.define(name, Recorder);
+    const el = mount("<span></span>").firstChild;
+    el.setAttributeNS("urn:x", name, "ns");
+    await tick();
+    eq(calls, []);
+    assert(!(el.getAttributeNodeNS("urn:x", name) instanceof Recorder));
+  });
+
+  test("callbacks are read once at define() time", async () => {
+    const calls = [];
+    const name = uniqueName();
+    class Late extends Attr {}
+    customAttributes.define(name, Late);
+    Late.prototype.connectedCallback = () => calls.push("late");
+    mount(`<span ${name}></span>`);
+    await tick();
+    eq(calls, []);
+  });
+
+  test("callback exceptions are reported, not thrown", async () => {
+    const name = uniqueName();
+    class Boom extends Attr {
+      connectedCallback() { throw new Error("connected boom"); }
+    }
+    customAttributes.define(name, Boom);
+    const errors = [];
+    const onError = (e) => { errors.push(e.error?.message); e.preventDefault(); };
+    window.addEventListener("error", onError);
+    mount(`<span ${name}></span>`);
+    await tick();
+    window.removeEventListener("error", onError);
+    eq(errors, ["connected boom"]);
+  });
+
+  test("moveBefore() runs connectedMoveCallback", async () => {
+    if (!Element.prototype.moveBefore) return;
+    const calls = [];
+    const name = uniqueName();
+    class Mover extends Attr {
+      connectedCallback() { calls.push("connected"); }
+      disconnectedCallback() { calls.push("disconnected"); }
+      connectedMoveCallback() { calls.push("moved"); }
+    }
+    customAttributes.define(name, Mover);
+    const a = mount("<div></div>").firstChild;
+    const b = mount("<div></div>").firstChild;
+    const el = document.createElement("span");
+    el.setAttribute(name, "");
+    a.append(el);
+    await tick();
+    calls.length = 0;
+    b.moveBefore(el, null);
+    await tick();
+    eq(calls, ["moved"]);
+    class Fallback extends Attr {
+      connectedCallback() { calls.push("connected"); }
+      disconnectedCallback() { calls.push("disconnected"); }
+    }
+    const name2 = uniqueName();
+    customAttributes.define(name2, Fallback);
+    el.setAttribute(name2, "");
+    await tick();
+    calls.length = 0;
+    a.moveBefore(el, null);
+    await tick();
+    eq(calls, ["moved", "disconnected", "connected"]);
+  });
+
+  test("adoptedCallback when adopted from an initialized document", async () => {
+    const { calls, Recorder } = recording();
+    const name = uniqueName();
+    const registry = new CustomAttributeRegistry();
+    registry.define(name, Recorder);
+    const foreign = document.implementation.createHTMLDocument("");
+    foreign.body.innerHTML = `<span id=ad ${name}="a"></span>`;
+    const el = foreign.body.firstChild;
+    registry.initialize(foreign);
+    eq(calls, [["constructor", "ad", "a"], ["changed", null, "a"], ["connected"]], "connected within its own document");
+    calls.length = 0;
+    el.setAttribute(name, "b");
+    await tick();
+    eq(calls, [["changed", "a", "b"]], "initialized documents are observed");
+    calls.length = 0;
+    el.remove();
+    await tick();
+    eq(calls, [["disconnected"]]);
+    calls.length = 0;
+    fixture.append(el);
+    await tick();
+    eq(calls, [["adopted", true], ["connected"]]);
+    eq(el.customAttributeRegistry === registry, true, "scoped registry survives adoption");
+  });
+
+  test("getAttributeNode() and attributes[] return the instance", async () => {
+    const name = uniqueName();
+    class Methods extends Attr {
+      hello() { return `hi ${this.value}`; }
+    }
+    customAttributes.define(name, Methods);
+    const el = mount(`<span ${name}="there"></span>`).firstChild;
+    await tick();
+    eq(el.attributes[name].hello(), "hi there");
+    eq(el.attributes[0] === el.getAttributeNode(name), true);
+  });
+
+  for (const { name, fn } of tests) {
+    const li = document.createElement("li");
+    try {
+      await fn();
+      li.className = "pass";
+      li.textContent = `PASS ${name}`;
+      results.pass++;
+    } catch (e) {
+      li.className = "fail";
+      li.textContent = `FAIL ${name}: ${e.message}`;
+      results.fail++;
+      results.failures.push(`${name}: ${e.message}`);
+      console.error(name, e);
+    }
+    log.append(li);
+  }
+  results.done = true;
+  document.title = `${results.fail ? "FAIL" : "PASS"} ${results.pass}/${tests.length}`;
+</script>

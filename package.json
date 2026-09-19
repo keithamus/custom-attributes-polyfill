@@ -1,0 +1,49 @@
+{
+  "name": "custom-attributes-polyfill",
+  "version": "0.0.0-development",
+  "description": "A polyfill for Custom Attributes (`customAttributes.define()` and `Attr` subclasses)",
+  "homepage": "https://github.com/keithamus/custom-attributes-polyfill#readme",
+  "bugs": {
+    "url": "https://github.com/keithamus/custom-attributes-polyfill/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/keithamus/custom-attributes-polyfill.git"
+  },
+  "license": "MIT",
+  "author": "Keith Cirkel (https://keithcirkel.co.uk)",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./custom-attributes.d.ts",
+      "import": "./index.js",
+      "browser": "./custom-attributes.min.js",
+      "require": "./custom-attributes.min.js"
+    },
+    "./fn": {
+      "types": "./index-fn.d.ts",
+      "import": "./custom-attributes.js"
+    }
+  },
+  "main": "index.js",
+  "types": "custom-attributes.d.ts",
+  "typesVersions": {
+    "*": {
+      "fn": [
+        "./index-fn.d.ts"
+      ]
+    }
+  },
+  "files": [
+    "*.d.ts",
+    "*.js"
+  ],
+  "scripts": {
+    "minify": "esbuild --bundle --minify index.js > custom-attributes.min.js",
+    "prepublishOnly": "npm run minify",
+    "test": "echo 'Open test.html in a browser'"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
+}
