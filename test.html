@@ -9,6 +9,7 @@
 <div id="fixture" hidden>
   <p id="parsed" x-parsed="from markup">parsed</p>
   <p id="parsed-later" x-later="late">parsed</p>
+  <div id="dsd"><template shadowrootmode="open"><span id="dsd-span"></span></template></div>
 </div>
 <ol id="log"></ol>
 <script type="module">
@@ -265,7 +266,13 @@
     }
     const bad = uniqueName();
     customAttributes.define(bad, Throws);
-    throws(() => document.createAttribute(bad), (e) => e.message === "boom", "rethrows");
+    const errors = [];
+    const onError = (e) => { errors.push(e.error); e.preventDefault(); };
+    window.addEventListener("error", onError);
+    const failed = document.createAttribute(bad);
+    window.removeEventListener("error", onError);
+    eq(errors.map((e) => e.message), ["boom"], "reported, not rethrown");
+    eq(failed.localName, bad, "returns the attribute");
   });
 
   test("constructor failure marks the attribute failed forever", async () => {
@@ -335,7 +342,7 @@
     assert(closed.firstChild.getAttributeNode(later) instanceof ScopedLater, "closed shadow root");
   });
 
-  test("createElement(), importNode(), setHTMLUnsafe() options", async () => {
+  test("createElement(), importNode() options and setHTMLUnsafe()", async () => {
     const name = uniqueName();
     class Global extends Attr {}
     class Scoped extends Attr {}
@@ -347,6 +354,7 @@
     eq(document.createElement("div").customAttributeRegistry === customAttributes, true);
     eq(document.createElement("div", { customAttributeRegistry: customAttributes }).customAttributeRegistry === customAttributes, true);
     throws(() => document.createElement("div", { customAttributeRegistry: {} }), isTypeError);
+    throws(() => document.importNode(el, { customAttributeRegistry: null }), isTypeError, "importNode() option is not nullable");
     const foreign = document.implementation.createHTMLDocument("");
     throws(() => foreign.createElement("div", { customAttributeRegistry: customAttributes }), isDOMException("NotSupportedError"), "global registry in another document");
     eq(foreign.createElement("div").customAttributeRegistry, null);
@@ -368,7 +376,11 @@
       const box = mount("<div></div>").firstChild;
       box.setHTMLUnsafe(`<i ${name}></i>`, { customAttributeRegistry: registry });
       await tick();
-      assert(box.firstChild.getAttributeNode(name) instanceof Scoped, "setHTMLUnsafe");
+      assert(box.firstChild.getAttributeNode(name) instanceof Global, "setHTMLUnsafe() has no customAttributeRegistry option");
+      const scopedRoot = mount("<div></div>").firstChild.attachShadow({ mode: "open", customAttributeRegistry: registry });
+      scopedRoot.setHTMLUnsafe(`<i ${name}></i>`);
+      await tick();
+      assert(scopedRoot.firstChild.getAttributeNode(name) instanceof Scoped, "setHTMLUnsafe() on a scoped shadow root");
     }
   });
 
@@ -495,6 +507,261 @@
     await tick();
     eq(el.attributes[name].hello(), "hi there");
     eq(el.attributes[0] === el.getAttributeNode(name), true);
+  });
+
+  test("attributes on SVG and MathML elements are never upgraded", async () => {
+    const name = uniqueName();
+    const { calls, Recorder } = recording();
+    const div = mount(`<svg ${name}="a"><rect ${name}="b"></rect></svg><math ${name}="c"></math>`);
+    customAttributes.define(name, Recorder);
+    await tick();
+    const svg = div.querySelector("svg");
+    const rect = div.querySelector("rect");
+    const math = div.querySelector("math");
+    rect.setAttribute(name, "d");
+    math.setAttribute(name, "e");
+    const parsed = mount(`<svg><circle ${name}="f"></circle></svg>`).querySelector("circle");
+    customAttributes.upgrade(div);
+    await tick();
+    eq(calls, []);
+    for (const el of [svg, rect, math, parsed]) {
+      eq(el.getAttributeNode(name) instanceof Recorder, false, el.localName);
+    }
+    eq(svg.customAttributeRegistry === customAttributes, true, "registry still stored");
+  });
+
+  test("foreignObject > div upgrades", async () => {
+    const name = uniqueName();
+    const { calls, Recorder } = recording();
+    customAttributes.define(name, Recorder);
+    const inner = mount(`<svg><foreignObject><div id="fo" ${name}="v"></div></foreignObject></svg>`).querySelector("#fo");
+    await tick();
+    eq(inner.customAttributeRegistry === customAttributes, true, "registry inherited");
+    eq(inner.getAttributeNode(name) instanceof Recorder, true, "upgraded");
+    eq(calls, [["constructor", "fo", "v"], ["changed", null, "v"], ["connected"]]);
+  });
+
+  test("define() accepts SVG attribute names, affecting only HTML elements", async () => {
+    const name = "stroke-width";
+    const { calls, Recorder } = recording();
+    const registry = new CustomAttributeRegistry();
+    registry.define(name, Recorder);
+    const div = document.createElement("div", { customAttributeRegistry: registry });
+    div.innerHTML = `<span id="sw" ${name}="1"></span><svg><rect ${name}="2"></rect></svg>`;
+    fixture.append(div);
+    await tick();
+    eq(div.querySelector("#sw").getAttributeNode(name) instanceof Recorder, true, "html");
+    eq(div.querySelector("rect").getAttributeNode(name) instanceof Recorder, false, "svg");
+    eq(calls, [["constructor", "sw", "1"], ["changed", null, "1"], ["connected"]]);
+  });
+
+  test("setAttributeNode() of a custom attribute on a non-HTML element throws", async () => {
+    const name = uniqueName();
+    const { calls, Recorder } = recording();
+    customAttributes.define(name, Recorder);
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    const math = document.createElementNS("http://www.w3.org/1998/Math/MathML", "math");
+    fixture.append(svg, math);
+    for (const el of [svg, math]) {
+      throws(() => el.setAttributeNode(new Recorder()), isDOMException("NotSupportedError"), "setAttributeNode");
+      throws(() => el.setAttributeNodeNS(document.createAttribute(name)), isDOMException("NotSupportedError"), "setAttributeNodeNS");
+      throws(() => el.attributes.setNamedItem(new Recorder()), isDOMException("NotSupportedError"), "setNamedItem");
+      throws(() => el.attributes.setNamedItemNS(new Recorder()), isDOMException("NotSupportedError"), "setNamedItemNS");
+      eq(el.hasAttribute(name), false, "not attached");
+    }
+    const plain = document.createAttribute("x-plain-unknown");
+    svg.setAttributeNode(plain);
+    eq(svg.getAttributeNode("x-plain-unknown") === plain, true, "plain attr allowed");
+    await tick();
+    eq(calls.filter(([c]) => c !== "constructor"), []);
+  });
+
+  test("setAttributeNode() on a non-HTML element throws before changing anything", () => {
+    const name = uniqueName();
+    const { Recorder } = recording();
+    customAttributes.define(name, Recorder);
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute(name, "old");
+    const old = svg.getAttributeNode(name);
+    const attr = new Recorder();
+    attr.value = "new";
+    throws(() => svg.setAttributeNode(attr), isDOMException("NotSupportedError"));
+    eq(svg.getAttributeNode(name) === old, true, "old attribute kept");
+    eq(svg.getAttribute(name), "old");
+    eq(attr.ownerElement, null);
+  });
+
+  test("createAttribute() reports failed post-construction checks", async () => {
+    const errors = [];
+    const onError = (e) => { errors.push(e.error); e.preventDefault(); };
+    const calls = [];
+    class Valued extends Attr {
+      constructor() { super(); this.value = "x"; }
+    }
+    const host = document.createElement("span");
+    class Attached extends Attr {
+      constructor() { super(); host.setAttributeNode(this); }
+      attributeChangedCallback(oldValue, newValue) { calls.push([oldValue, newValue]); }
+    }
+    const valued = uniqueName();
+    const attachedName = uniqueName();
+    customAttributes.define(valued, Valued);
+    customAttributes.define(attachedName, Attached);
+    window.addEventListener("error", onError);
+    const a = document.createAttribute(valued);
+    const b = document.createAttributeNS(null, attachedName);
+    window.removeEventListener("error", onError);
+    eq(errors.map((e) => e.name), ["NotSupportedError", "NotSupportedError"]);
+    eq(a.value, "x");
+    eq(b.ownerElement === host, true, "left attached");
+    eq(calls, [[null, ""]], "custom while the constructor runs");
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttributeNode(a);
+    eq(svg.getAttributeNode(valued) === a, true, "failed attributes are not custom");
+    calls.length = 0;
+    host.setAttribute(attachedName, "y");
+    host.removeAttribute(attachedName);
+    await tick();
+    eq(calls, [], "no callbacks after failure");
+  });
+
+  test("createAttribute() and createAttributeNS() options", () => {
+    const name = uniqueName();
+    class Global extends Attr {}
+    class Scoped extends Attr {}
+    customAttributes.define(name, Global);
+    const registry = new CustomAttributeRegistry();
+    registry.define(name, Scoped);
+    assert(document.createAttributeNS(null, name) instanceof Global, "createAttributeNS() constructs");
+    assert(!(document.createAttributeNS("urn:x", name) instanceof Global), "namespaced attributes are not constructed");
+    assert(document.createAttribute(name, { customAttributeRegistry: registry }) instanceof Scoped, "createAttribute() scoped");
+    assert(document.createAttributeNS(null, name, { customAttributeRegistry: registry }) instanceof Scoped, "createAttributeNS() scoped");
+    assert(document.createAttribute(name, { customAttributeRegistry: customAttributes }) instanceof Global, "own global registry");
+    eq(document.createAttribute(name, { customAttributeRegistry: null }).constructor === Attr, true, "null registry");
+    throws(() => document.createAttribute(name, { customAttributeRegistry: {} }), isTypeError);
+    const foreign = document.implementation.createHTMLDocument("");
+    throws(() => foreign.createAttribute(name, { customAttributeRegistry: customAttributes }), isDOMException("NotSupportedError"), "global registry in another document");
+    throws(() => foreign.createAttributeNS(null, name, { customAttributeRegistry: customAttributes }), isDOMException("NotSupportedError"), "createAttributeNS() global registry in another document");
+    assert(foreign.createAttribute(name, { customAttributeRegistry: registry }) instanceof Scoped, "scoped registry in another document");
+    throws(() => document.createAttribute("x y", { customAttributeRegistry: {} }), isTypeError, "option conversion first");
+    throws(() => foreign.createAttribute("x y", { customAttributeRegistry: customAttributes }), isDOMException("InvalidCharacterError"), "name validation before registry check");
+  });
+
+  test("an explicit null customAttributeRegistry is kept until initialize()", async () => {
+    const name = uniqueName();
+    const { calls, Recorder } = recording();
+    customAttributes.define(name, Recorder);
+    const el = document.createElement("div", { customAttributeRegistry: null });
+    eq(el.customAttributeRegistry, null, "createElement()");
+    eq(document.createElementNS("http://www.w3.org/1999/xhtml", "div", { customAttributeRegistry: null }).customAttributeRegistry, null, "createElementNS()");
+    el.setAttribute(name, "v");
+    fixture.append(el);
+    await tick();
+    eq(el.getAttributeNode(name) instanceof Recorder, false, "global definitions do not apply");
+    customAttributes.upgrade(el);
+    eq(calls, [], "upgrade() skips it");
+    class Scoped extends Attr {}
+    const registry = new CustomAttributeRegistry();
+    registry.define(name, Scoped);
+    registry.initialize(el);
+    eq(el.customAttributeRegistry === registry, true, "initialize() takes over the element");
+    assert(el.getAttributeNode(name) instanceof Scoped, "element upgraded");
+    const host = mount("<div></div>").firstChild;
+    const shadow = host.attachShadow({ mode: "open", customAttributeRegistry: null });
+    eq(shadow.customAttributeRegistry, null, "attachShadow()");
+    shadow.innerHTML = `<b ${name}></b>`;
+    await tick();
+    eq(shadow.firstChild.customAttributeRegistry, null, "shadow content");
+    eq(shadow.firstChild.getAttributeNode(name) instanceof Recorder, false, "shadow content not upgraded");
+    registry.initialize(shadow);
+    eq(shadow.customAttributeRegistry === registry, true, "initialize() takes over the shadow root");
+    assert(shadow.firstChild.getAttributeNode(name) instanceof Scoped, "shadow content upgraded");
+    eq(calls, []);
+  });
+
+  test("registries follow the adopt steps", () => {
+    const foreign = document.implementation.createHTMLDocument("");
+    const fromForeign = foreign.createElement("div");
+    eq(fromForeign.customAttributeRegistry, null);
+    fixture.append(fromForeign);
+    eq(fromForeign.customAttributeRegistry === customAttributes, true, "null becomes the global registry");
+    const fromMain = document.createElement("div");
+    foreign.body.append(fromMain);
+    eq(fromMain.customAttributeRegistry, null, "global registry is not carried into another document");
+    const registry = new CustomAttributeRegistry();
+    const scoped = document.createElement("div", { customAttributeRegistry: registry });
+    foreign.body.append(scoped);
+    eq(scoped.customAttributeRegistry === registry, true, "scoped registry is kept");
+    const host = foreign.createElement("div");
+    const shadow = host.attachShadow({ mode: "open" });
+    eq(shadow.customAttributeRegistry, null);
+    fixture.append(host);
+    eq(shadow.customAttributeRegistry === customAttributes, true, "shadow root");
+  });
+
+  test("setAttributeNode() on a disconnected element upgrades synchronously", async () => {
+    const { calls, Recorder } = recording();
+    const name = uniqueName();
+    customAttributes.define(name, Recorder);
+    const foreign = document.implementation.createHTMLDocument("");
+    const plain = foreign.createAttribute(name);
+    plain.value = "p";
+    const el = document.createElement("i");
+    el.id = "sn";
+    el.setAttributeNode(plain);
+    assert(el.getAttributeNode(name) instanceof Recorder, "upgraded");
+    eq(calls, [["constructor", "sn", "p"], ["changed", null, "p"]]);
+    calls.length = 0;
+    const attr = new Recorder();
+    calls.length = 0;
+    attr.value = "q";
+    document.createElement("i").attributes.setNamedItem(attr);
+    eq(calls, [["changed", null, "q"]], "custom attribute attached to a disconnected element");
+    calls.length = 0;
+    el.setAttribute(name, "p2");
+    await tick();
+    eq(calls, [["changed", "p", "p2"]], "observed afterwards");
+  });
+
+  test("adoptedCallback when attached to an element in another document", async () => {
+    const { calls, Recorder } = recording();
+    const name = uniqueName();
+    customAttributes.define(name, Recorder);
+    const attr = new Recorder();
+    calls.length = 0;
+    const foreign = document.implementation.createHTMLDocument("");
+    const el = foreign.createElement("span");
+    foreign.body.append(el);
+    el.setAttributeNode(attr);
+    eq(attr.ownerDocument === foreign, true);
+    eq(calls, [["adopted", true], ["changed", null, ""], ["connected"]], "unobserved element");
+    el.removeAttributeNode(attr);
+    await tick();
+    calls.length = 0;
+    mount("<span></span>").firstChild.setAttributeNode(attr);
+    await tick();
+    eq(calls, [["adopted", true], ["changed", null, ""], ["connected"]], "observed element");
+  });
+
+  test("pre-existing declarative shadow roots are observed", async () => {
+    const { calls, Recorder } = recording();
+    const name = uniqueName();
+    customAttributes.define(name, Recorder);
+    const shadow = document.getElementById("dsd").shadowRoot;
+    assert(shadow, "declarative shadow root parsed");
+    shadow.getElementById("dsd-span").setAttribute(name, "a");
+    const added = document.createElement("b");
+    added.id = "dsd-added";
+    added.setAttribute(name, "b");
+    shadow.append(added);
+    await tick();
+    eq(calls, [["constructor", "dsd-span", "a"], ["changed", null, "a"], ["connected"], ["constructor", "dsd-added", "b"], ["changed", null, "b"], ["connected"]]);
+  });
+
+  test("Attr.prototype is not writable", () => {
+    const descriptor = Object.getOwnPropertyDescriptor(Attr, "prototype");
+    eq([descriptor.writable, descriptor.enumerable, descriptor.configurable], [false, false, false]);
+    eq(Attr.prototype === Object.getPrototypeOf(document.createAttribute("x")), true);
   });
 
   for (const { name, fn } of tests) {

@@ -60,54 +60,54 @@
   // ownerElement is null inside disconnectedCallback when the attribute
   // itself was removed, so the element is remembered on connect.
   class PersistValue extends Attr {
-    #element = null;
+    #owner = null;
 
     connectedCallback() {
-      this.#element = this.ownerElement;
-      log(`persist-value connected to <${this.#element.localName}>`);
+      this.#owner = this.ownerElement;
+      log(`persist-value connected to <${this.#owner.localName}>`);
       const stored = localStorage.getItem(this.key);
-      if (stored !== null) this.#element.value = stored;
-      this.#element.addEventListener("input", this);
+      if (stored !== null) this.#owner.value = stored;
+      this.#owner.addEventListener("input", this);
     }
 
     disconnectedCallback() {
       log(`persist-value disconnected`);
-      this.#element.removeEventListener("input", this);
-      this.#element = null;
+      this.#owner.removeEventListener("input", this);
+      this.#owner = null;
     }
 
     attributeChangedCallback(oldValue, newValue) {
-      this.key = newValue || this.ownerElement.name;
+      this.key = newValue || this.ownerElement?.name;
     }
 
     handleEvent() {
-      localStorage.setItem(this.key, this.#element.value);
+      localStorage.setItem(this.key, this.#owner.value);
     }
   }
 
   // Form controls are replaced elements and cannot render ::after, so the
   // count is written to the enclosing <label>.
   class WordCount extends Attr {
-    #element = null;
+    #owner = null;
     #target = null;
 
     connectedCallback() {
-      this.#element = this.ownerElement;
-      this.#target = this.#element.closest("label") ?? this.#element;
+      this.#owner = this.ownerElement;
+      this.#target = this.#owner.closest("label") ?? this.#owner;
       log(`word-count connected`);
-      this.#element.addEventListener("input", this);
+      this.#owner.addEventListener("input", this);
       this.handleEvent();
     }
 
     disconnectedCallback() {
       log(`word-count disconnected`);
-      this.#element.removeEventListener("input", this);
+      this.#owner.removeEventListener("input", this);
       this.#target.removeAttribute("data-word-count");
-      this.#element = this.#target = null;
+      this.#owner = this.#target = null;
     }
 
     handleEvent() {
-      const words = this.#element.value.trim().split(/\s+/).filter(Boolean);
+      const words = this.#owner.value.trim().split(/\s+/).filter(Boolean);
       this.#target.setAttribute("data-word-count", words.length);
     }
   }

@@ -15,10 +15,17 @@ export function isPolyfilled() {
 export function apply() {
   const NativeAttr = globalThis.Attr;
   const nativeCreateAttribute = Document.prototype.createAttribute;
+  const nativeCreateAttributeNS = Document.prototype.createAttributeNS;
   const nativeCreateElement = Document.prototype.createElement;
   const nativeCreateElementNS = Document.prototype.createElementNS;
   const nativeImportNode = Document.prototype.importNode;
   const nativeAttachShadow = Element.prototype.attachShadow;
+  const nativeAttributes = Object.getOwnPropertyDescriptor(
+    Element.prototype,
+    "attributes",
+  ).get;
+
+  const HTML_NAMESPACE = "http://www.w3.org/1999/xhtml";
 
   const ALREADY_CONSTRUCTED = Symbol("already constructed");
   const CALLBACK_NAMES = [
@@ -38,8 +45,10 @@ export function apply() {
 
   // CustomAttributeRegistry -> { scoped, byName, byConstructor, running, whenDefined, documents }
   const internals = new WeakMap();
-  // Element | ShadowRoot | Document -> CustomAttributeRegistry
+  // Element | ShadowRoot | Document -> CustomAttributeRegistry or null
   const registries = new WeakMap();
+  // Element | ShadowRoot -> its node document when its registry was set
+  const registryDocuments = new WeakMap();
   // Attr -> { state, definition, connected, document }
   const entries = new WeakMap();
   // Element -> Map<localName, Attr> of its custom attributes
@@ -48,6 +57,12 @@ export function apply() {
   const closedShadows = new WeakMap();
   // constructor -> CustomAttributeRegistry, the "active custom attribute constructor map"
   const activeRegistries = new Map();
+  // NamedNodeMap -> Element
+  const attributeMaps = new WeakMap();
+
+  function isHTML(element) {
+    return element.namespaceURI === HTML_NAMESPACE;
+  }
 
   function enumerate(obj, key) {
     Object.defineProperty(obj, key, {
@@ -110,16 +125,53 @@ export function apply() {
     return elements;
   }
 
+  function isExclusiveFragment(node) {
+    return (
+      node.nodeType === Node.DOCUMENT_FRAGMENT_NODE &&
+      !(node instanceof ShadowRoot)
+    );
+  }
+
+  function effectiveGlobal(registry) {
+    return registry && !internals.get(registry).scoped ? registry : null;
+  }
+
+  function setRegistry(node, registry) {
+    registries.set(node, registry);
+    registryDocuments.set(node, node.ownerDocument);
+  }
+
   function registryOf(node) {
-    const known = registries.get(node);
-    if (known) return known;
+    if (node.nodeType === Node.DOCUMENT_NODE) {
+      return registries.get(node) ?? null;
+    }
+    if (registries.has(node)) {
+      const registry = registries.get(node);
+      if (
+        registryDocuments.get(node) === node.ownerDocument ||
+        (registry && internals.get(registry).scoped)
+      ) {
+        return registry;
+      }
+      // The node was adopted since its registry was set: apply the adopt
+      // steps now, using its current parent.
+      const parent = node.parentNode;
+      const adopted = effectiveGlobal(
+        node.nodeType !== Node.ELEMENT_NODE ||
+          registry ||
+          !parent ||
+          isExclusiveFragment(parent)
+          ? registryOf(node.ownerDocument)
+          : registryOf(parent),
+      );
+      setRegistry(node, adopted);
+      return adopted;
+    }
     let registry = null;
     if (node.nodeType === Node.ELEMENT_NODE) {
       const parent = node.parentNode;
       registry =
-        parent &&
-        (parent.nodeType !== Node.DOCUMENT_FRAGMENT_NODE ||
-          parent instanceof ShadowRoot)
+        parent && !isExclusiveFragment(parent)
           ? registryOf(parent)
           : node.ownerDocument === document
             ? globalRegistry
@@ -127,7 +179,7 @@ export function apply() {
     } else if (node instanceof ShadowRoot) {
       registry = node.ownerDocument === document ? globalRegistry : null;
     }
-    if (registry) registries.set(node, registry);
+    if (registry) setRegistry(node, registry);
     return registry;
   }
 
@@ -136,13 +188,21 @@ export function apply() {
     return internals.get(registry).byName.get(localName) || null;
   }
 
-  function checkRegistryOption(registry, doc) {
-    if (registry === undefined) return undefined;
-    if (registry !== null && !internals.has(registry)) {
+  function registryOption(options, nullable) {
+    if (typeof options !== "object" || options === null) return undefined;
+    const registry = options.customAttributeRegistry;
+    if (registry === undefined || (registry === null && nullable)) {
+      return registry;
+    }
+    if (!internals.has(registry)) {
       throw new TypeError(
-        "customAttributeRegistry must be a CustomAttributeRegistry or null",
+        `customAttributeRegistry must be a CustomAttributeRegistry${nullable ? " or null" : ""}`,
       );
     }
+    return registry;
+  }
+
+  function checkRegistry(registry, doc) {
     if (
       registry &&
       !internals.get(registry).scoped &&
@@ -153,7 +213,6 @@ export function apply() {
         "NotSupportedError",
       );
     }
-    return registry;
   }
 
   function invoke(attribute, name, args) {
@@ -188,6 +247,7 @@ export function apply() {
   }
 
   function track(element, attribute) {
+    if (!isHTML(element)) return;
     let map = tracked.get(element);
     if (!map) {
       tracked.set(element, (map = new Map()));
@@ -203,46 +263,85 @@ export function apply() {
     }
   }
 
-  function construct(attribute, entry, definition, registry) {
+  function adopt(attribute, entry, newDocument) {
+    const oldDocument = entry.document;
+    if (oldDocument === newDocument) return;
+    entry.document = newDocument;
+    invoke(attribute, "adoptedCallback", [oldDocument, newDocument]);
+  }
+
+  function runConstructor(attribute, definition, registry, check) {
     const C = definition.constructor;
     definition.constructionStack.push(attribute);
     const previous = activeRegistries.get(C);
     activeRegistries.set(C, registry);
     try {
-      entry.state = "precustomized";
       const result = new C();
       if (result !== attribute) {
         throw new TypeError(
           "Custom attribute constructor returned a different object",
         );
       }
-    } catch (error) {
-      entry.definition = null;
-      entry.state = "failed";
-      throw error;
+      check?.();
     } finally {
       if (previous === undefined) activeRegistries.delete(C);
       else activeRegistries.set(C, previous);
       definition.constructionStack.pop();
     }
-    entry.state = "custom";
+  }
+
+  // "Construct a custom attribute", for createAttribute() and
+  // createAttributeNS(). Failures are reported, never rethrown.
+  function construct(attribute, definition, registry) {
+    const { ownerDocument, localName, namespaceURI, prefix } = attribute;
+    const entry = {
+      state: "custom",
+      definition,
+      connected: false,
+      document: ownerDocument,
+    };
+    entries.set(attribute, entry);
+    try {
+      runConstructor(attribute, definition, registry, () => {
+        if (
+          attribute.ownerElement !== null ||
+          attribute.ownerDocument !== ownerDocument ||
+          attribute.localName !== localName ||
+          attribute.namespaceURI !== namespaceURI ||
+          attribute.prefix !== prefix ||
+          attribute.value !== ""
+        ) {
+          throw new DOMException(
+            "Custom attribute constructor must leave the attribute unattached and empty",
+            "NotSupportedError",
+          );
+        }
+      });
+    } catch (error) {
+      entry.definition = null;
+      entry.state = "failed";
+      reportError(error);
+    }
   }
 
   function upgrade(attribute, definition, registry, value) {
     if (entries.has(attribute)) return;
     const entry = {
-      state: "failed",
+      state: "precustomized",
       definition,
       connected: false,
       document: attribute.ownerElement.ownerDocument,
     };
     entries.set(attribute, entry);
     try {
-      construct(attribute, entry, definition, registry);
+      runConstructor(attribute, definition, registry);
     } catch (error) {
+      entry.definition = null;
+      entry.state = "failed";
       reportError(error);
       return;
     }
+    entry.state = "custom";
     const element = attribute.ownerElement;
     track(element, attribute);
     invoke(attribute, "attributeChangedCallback", [null, value]);
@@ -251,7 +350,7 @@ export function apply() {
 
   function tryUpgrade(attribute, value = attribute.value) {
     const element = attribute.ownerElement;
-    if (!element || entries.has(attribute)) return;
+    if (!element || !isHTML(element) || entries.has(attribute)) return;
     const registry = registryOf(element);
     const definition = lookupDefinition(
       registry,
@@ -324,16 +423,15 @@ export function apply() {
     reconcileTree(node) {
       if (node.nodeType !== Node.ELEMENT_NODE) return;
       for (const element of shadowIncludingElements(node)) {
-        const shadow = element.shadowRoot;
-        if (shadow && !observedRoots.has(shadow)) observeRoot(shadow);
+        observeShadowRoot(element);
         this.reconcileElement(element);
       }
     }
 
     reconcileElement(element) {
-      if (!element.hasAttributes()) return;
+      if (!isHTML(element) || !element.hasAttributes()) return;
       const connected = element.isConnected;
-      for (const attribute of Array.from(element.attributes)) {
+      for (const attribute of Array.from(nativeAttributes.call(element))) {
         const name = attribute.localName;
         if (attribute.namespaceURI !== null || this.addedLater(element, name)) {
           continue;
@@ -351,15 +449,13 @@ export function apply() {
         if (entry.state !== "custom") continue;
         if (tracked.get(element)?.get(name) !== attribute) {
           track(element, attribute);
+          adopt(attribute, entry, element.ownerDocument);
           invoke(attribute, "attributeChangedCallback", [
             null,
             this.valueAfter(element, name) ?? attribute.value,
           ]);
-        }
-        if (element.ownerDocument !== entry.document) {
-          const oldDocument = entry.document;
-          entry.document = element.ownerDocument;
-          invoke(attribute, "adoptedCallback", [oldDocument, entry.document]);
+        } else {
+          adopt(attribute, entry, element.ownerDocument);
         }
         if (connected !== entry.connected) {
           if (connected) connect(attribute, entry);
@@ -369,6 +465,7 @@ export function apply() {
     }
 
     reconcileAttribute(element, name, oldValue) {
+      if (!isHTML(element)) return;
       const previous = tracked.get(element)?.get(name);
       const current = element.getAttributeNodeNS(null, name);
       if (previous && previous === current) {
@@ -390,9 +487,10 @@ export function apply() {
       if (entry) {
         if (entry.state !== "custom") return;
         track(element, current);
+        adopt(current, entry, element.ownerDocument);
         invoke(current, "attributeChangedCallback", [null, value]);
         if (element.isConnected) connect(current, entry);
-      } else if (element.isConnected) {
+      } else {
         tryUpgrade(current, value);
       }
     }
@@ -408,6 +506,11 @@ export function apply() {
   function observeRoot(root) {
     observedRoots.add(root);
     observer.observe(root, ROOT_OPTIONS);
+  }
+
+  function observeShadowRoot(element) {
+    const shadow = element.shadowRoot;
+    if (shadow && !observedRoots.has(shadow)) observeRoot(shadow);
   }
 
   function flush() {
@@ -487,9 +590,11 @@ export function apply() {
       flush();
       for (const doc of new Set([document, ...self.documents])) {
         for (const element of shadowIncludingElements(doc)) {
+          observeShadowRoot(element);
           const attribute = element.getAttributeNodeNS(null, name);
           if (
             attribute &&
+            isHTML(element) &&
             !entries.has(attribute) &&
             registryOf(element) === this
           ) {
@@ -543,7 +648,7 @@ export function apply() {
       flush();
       for (const element of shadowIncludingElements(root)) {
         if (registryOf(element) !== this) continue;
-        for (const attribute of Array.from(element.attributes)) {
+        for (const attribute of Array.from(nativeAttributes.call(element))) {
           tryUpgrade(attribute);
         }
       }
@@ -564,15 +669,15 @@ export function apply() {
         );
       }
       if ((isDocument || root instanceof ShadowRoot) && !registryOf(root)) {
-        registries.set(root, this);
+        setRegistry(root, this);
       }
       const doc = isDocument ? root : root.ownerDocument;
       if (self.scoped) self.documents.add(doc);
       if (!observedRoots.has(doc)) observeRoot(doc);
       for (const element of treeElements(root)) {
-        if (!registryOf(element)) registries.set(element, this);
+        if (!registryOf(element)) setRegistry(element, this);
         if (registryOf(element) !== this) continue;
-        for (const attribute of Array.from(element.attributes)) {
+        for (const attribute of Array.from(nativeAttributes.call(element))) {
           tryUpgrade(attribute);
         }
       }
@@ -631,7 +736,10 @@ export function apply() {
     stack[stack.length - 1] = ALREADY_CONSTRUCTED;
     return attribute;
   }
-  Attr.prototype = NativeAttr.prototype;
+  Object.defineProperty(Attr, "prototype", {
+    value: NativeAttr.prototype,
+    writable: false,
+  });
   Object.setPrototypeOf(Attr, Object.getPrototypeOf(NativeAttr));
   Object.defineProperty(NativeAttr.prototype, "constructor", {
     value: Attr,
@@ -670,37 +778,50 @@ export function apply() {
     configurable: true,
   });
 
-  Document.prototype.createAttribute = function createAttribute(localName) {
-    const attribute = nativeCreateAttribute.call(this, localName);
-    const registry = registryOf(this);
-    const definition = lookupDefinition(registry, null, attribute.localName);
-    if (definition) {
-      const entry = {
-        state: "precustomized",
-        definition,
-        connected: false,
-        document: this,
-      };
-      entries.set(attribute, entry);
-      construct(attribute, entry, definition, registry);
-    }
+  function createCustomAttribute(doc, attribute, registry) {
+    if (registry === undefined) registry = registryOf(doc);
+    const definition = lookupDefinition(
+      registry,
+      attribute.namespaceURI,
+      attribute.localName,
+    );
+    if (definition) construct(attribute, definition, registry);
     return attribute;
+  }
+
+  Document.prototype.createAttribute = function createAttribute(
+    localName,
+    options = {},
+  ) {
+    const registry = registryOption(options, true);
+    const attribute = nativeCreateAttribute.call(this, localName);
+    checkRegistry(registry, this);
+    return createCustomAttribute(this, attribute, registry);
   };
 
-  function optionRegistry(options, doc) {
-    return typeof options === "object" && options !== null
-      ? checkRegistryOption(options.customAttributeRegistry, doc)
-      : undefined;
-  }
+  Document.prototype.createAttributeNS = function createAttributeNS(
+    namespace,
+    qualifiedName,
+    options = {},
+  ) {
+    const registry = registryOption(options, true);
+    const attribute = nativeCreateAttributeNS.call(
+      this,
+      namespace,
+      qualifiedName,
+    );
+    checkRegistry(registry, this);
+    return createCustomAttribute(this, attribute, registry);
+  };
 
   Document.prototype.createElement = function createElement(
     localName,
     options,
   ) {
-    const registry = optionRegistry(options, this);
+    const registry = registryOption(options, true);
     const element = nativeCreateElement.call(this, localName, options);
-    const chosen = registry === undefined ? registryOf(this) : registry;
-    if (chosen) registries.set(element, chosen);
+    checkRegistry(registry, this);
+    setRegistry(element, registry === undefined ? registryOf(this) : registry);
     return element;
   };
 
@@ -709,64 +830,47 @@ export function apply() {
     qualifiedName,
     options,
   ) {
-    const registry = optionRegistry(options, this);
+    const registry = registryOption(options, true);
     const element = nativeCreateElementNS.call(
       this,
       namespace,
       qualifiedName,
       options,
     );
-    const chosen = registry === undefined ? registryOf(this) : registry;
-    if (chosen) registries.set(element, chosen);
+    checkRegistry(registry, this);
+    setRegistry(element, registry === undefined ? registryOf(this) : registry);
     return element;
   };
 
   Document.prototype.importNode = function importNode(node, options = false) {
-    const registry = optionRegistry(options, this);
+    const registry = registryOption(options, false);
+    checkRegistry(registry, this);
     const copy = nativeImportNode.call(this, node, options);
     const fallback = registry ?? registryOf(this);
-    if (fallback) {
-      const sources = treeElements(node);
-      treeElements(copy).forEach((element, i) => {
-        const own = sources[i] && registryOf(sources[i]);
-        registries.set(
-          element,
-          own ? (internals.get(own).scoped ? own : registryOf(this)) : fallback,
-        );
-      });
-    }
+    const global = effectiveGlobal(registryOf(this));
+    const sources = treeElements(node);
+    treeElements(copy).forEach((element, i) => {
+      const chosen = (sources[i] && registryOf(sources[i])) || fallback;
+      setRegistry(
+        element,
+        chosen && !internals.get(chosen).scoped ? global : chosen,
+      );
+    });
     return copy;
   };
 
   Element.prototype.attachShadow = function attachShadow(init) {
-    const registry = optionRegistry(init, this.ownerDocument);
+    const registry = registryOption(init, true);
+    checkRegistry(registry, this.ownerDocument);
     const shadow = nativeAttachShadow.call(this, init);
-    const chosen =
-      registry === undefined ? registryOf(this.ownerDocument) : registry;
-    if (chosen) registries.set(shadow, chosen);
+    setRegistry(
+      shadow,
+      registry === undefined ? registryOf(this.ownerDocument) : registry,
+    );
     if (shadow.mode === "closed") closedShadows.set(this, shadow);
     observeRoot(shadow);
     return shadow;
   };
-
-  for (const proto of [Element.prototype, ShadowRoot.prototype]) {
-    for (const name of ["setHTMLUnsafe", "setHTML"]) {
-      const native = proto[name];
-      if (!native) continue;
-      proto[name] = {
-        [name](html, options) {
-          const registry = optionRegistry(options, this.ownerDocument);
-          const result = native.call(this, html, options);
-          if (registry) {
-            for (const element of this.querySelectorAll("*")) {
-              registries.set(element, registry);
-            }
-          }
-          return result;
-        },
-      }[name];
-    }
-  }
 
   for (const proto of [
     Element.prototype,
@@ -779,7 +883,7 @@ export function apply() {
       const result = native.call(this, node, child);
       if (this.isConnected && node.nodeType === Node.ELEMENT_NODE) {
         for (const element of shadowIncludingElements(node)) {
-          for (const attribute of Array.from(element.attributes)) {
+          for (const attribute of Array.from(nativeAttributes.call(element))) {
             const entry = entries.get(attribute);
             if (entry?.state === "custom" && entry.connected) {
               invoke(attribute, "connectedMoveCallback", []);
@@ -791,5 +895,73 @@ export function apply() {
     };
   }
 
+  function checkAttachable(element, attribute) {
+    if (entries.get(attribute)?.definition && !isHTML(element)) {
+      throw new DOMException(
+        "Custom attributes can only be set on HTML elements",
+        "NotSupportedError",
+      );
+    }
+  }
+
+  // Mutations of elements no observer sees (disconnected and untracked) are
+  // processed synchronously, so that attaching an attribute node upgrades it
+  // or runs its callbacks as the specification does.
+  function attached(element, attribute, oldAttribute) {
+    if (
+      oldAttribute === attribute ||
+      tracked.has(element) ||
+      observedRoots.has(element.getRootNode())
+    ) {
+      return;
+    }
+    processRecords([
+      {
+        type: "attributes",
+        target: element,
+        attributeName: attribute.localName,
+        attributeNamespace: attribute.namespaceURI,
+        oldValue: oldAttribute ? oldAttribute.value : null,
+      },
+    ]);
+  }
+
+  Object.defineProperty(Element.prototype, "attributes", {
+    ...Object.getOwnPropertyDescriptor(Element.prototype, "attributes"),
+    get: function attributes() {
+      const map = nativeAttributes.call(this);
+      attributeMaps.set(map, this);
+      return map;
+    },
+  });
+
+  for (const name of ["setAttributeNode", "setAttributeNodeNS"]) {
+    const native = Element.prototype[name];
+    Element.prototype[name] = {
+      [name](attr) {
+        checkAttachable(this, attr);
+        const old = native.call(this, attr);
+        attached(this, attr, old);
+        return old;
+      },
+    }[name];
+  }
+
+  for (const name of ["setNamedItem", "setNamedItemNS"]) {
+    const native = NamedNodeMap.prototype[name];
+    NamedNodeMap.prototype[name] = {
+      [name](attr) {
+        const element = attributeMaps.get(this);
+        if (element) checkAttachable(element, attr);
+        const old = native.call(this, attr);
+        if (element) attached(element, attr, old);
+        return old;
+      },
+    }[name];
+  }
+
   observeRoot(document);
+  for (const element of shadowIncludingElements(document)) {
+    observeShadowRoot(element);
+  }
 }

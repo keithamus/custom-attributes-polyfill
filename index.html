@@ -35,19 +35,23 @@
   attribute on a connected element is upgraded in place to an instance of your
   class, with lifecycle callbacks mirroring custom elements. Where a custom
   element models what an element <em>is</em>, a custom attribute models a
-  behaviour an element <em>has</em>, and can be applied to any element: HTML,
-  SVG, MathML, or another custom element.
+  behaviour an element <em>has</em>, and can be applied to any HTML element,
+  including another custom element.
 </p>
 
 <pre><code>class PersistValue extends Attr {
+  #owner = null;
+
   connectedCallback() {
+    this.#owner = this.ownerElement;
     const stored = localStorage.getItem(this.value);
-    if (stored !== null) this.ownerElement.value = stored;
-    this.ownerElement.addEventListener("input", this);
+    if (stored !== null) this.#owner.value = stored;
+    this.#owner.addEventListener("input", this);
   }
 
   disconnectedCallback() {
-    this.ownerElement.removeEventListener("input", this);
+    this.#owner.removeEventListener("input", this);
+    this.#owner = null;
   }
 
   attributeChangedCallback(oldValue, newValue) {
@@ -55,7 +59,7 @@
   }
 
   handleEvent() {
-    localStorage.setItem(this.value, this.ownerElement.value);
+    localStorage.setItem(this.value, this.#owner.value);
   }
 }
 
@@ -75,12 +79,12 @@ customAttributes.define("persist-value", PersistValue);</code></pre>
 
 <table>
   <tr><th>Callback</th><th>Runs when</th></tr>
-  <tr><td><code>constructor()</code></td><td>the attribute is upgraded, constructed directly, or created by <code>document.createAttribute()</code></td></tr>
+  <tr><td><code>constructor()</code></td><td>the attribute is upgraded, constructed directly, or created by <code>document.createAttribute()</code> or <code>document.createAttributeNS()</code></td></tr>
   <tr><td><code>attributeChangedCallback(oldValue, newValue)</code></td><td>the value is added, changed or removed; once on upgrade with its initial value</td></tr>
   <tr><td><code>connectedCallback()</code></td><td>added to a connected element, or its element is inserted into a document</td></tr>
   <tr><td><code>disconnectedCallback()</code></td><td>removed from a connected element, or its element is removed</td></tr>
   <tr><td><code>connectedMoveCallback()</code></td><td>its element is moved with <code>moveBefore()</code></td></tr>
-  <tr><td><code>adoptedCallback(oldDocument, newDocument)</code></td><td>its element is adopted into another document</td></tr>
+  <tr><td><code>adoptedCallback(oldDocument, newDocument)</code></td><td>its element is adopted into another document, or it is attached to an element in another document</td></tr>
 </table>
 
 <h2>Using the polyfill</h2>
@@ -96,18 +100,19 @@ if (!isSupported()) apply();</code></pre>
   The polyfill covers <code>window.customAttributes</code>,
   <code>CustomAttributeRegistry</code> (including scoped registries for shadow
   trees), the <code>Attr</code> constructor,
-  <code>document.createAttribute()</code>, and the
+  <code>document.createAttribute()</code>,
+  <code>document.createAttributeNS()</code>, and the
   <code>customAttributeRegistry</code> option on <code>createElement()</code>,
-  <code>importNode()</code>, <code>attachShadow()</code> and
-  <code>setHTMLUnsafe()</code>.
+  <code>createAttribute()</code>, <code>importNode()</code> and
+  <code>attachShadow()</code>.
 </p>
 
 <h2>Limitations</h2>
 
 <ul>
-  <li>Reactions run at the next microtask checkpoint, not synchronously at the end of the DOM operation. <code>define()</code>, <code>upgrade()</code>, <code>initialize()</code> and <code>createAttribute()</code> are synchronous.</li>
+  <li>Reactions run at the next microtask checkpoint, not synchronously at the end of the DOM operation. <code>define()</code>, <code>upgrade()</code>, <code>initialize()</code>, <code>createAttribute()</code> and <code>createAttributeNS()</code> are synchronous.</li>
   <li>An element removed and re-inserted within the same task keeps its attributes connected; no <code>disconnectedCallback</code>/<code>connectedCallback</code> pair fires.</li>
-  <li>Only <code>document</code>, shadow roots, and documents passed to <code>initialize()</code> are observed.</li>
+  <li>Only <code>document</code>, shadow roots, and documents passed to <code>initialize()</code> are observed. Closed shadow roots that exist before the polyfill is applied are never observed.</li>
   <li>An element's registry is fixed the first time the polyfill needs it rather than at creation; <code>cloneNode()</code> does not copy it.</li>
 </ul>
 

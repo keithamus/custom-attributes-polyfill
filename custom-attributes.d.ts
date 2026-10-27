@@ -32,6 +32,12 @@ declare global {
   }
   interface Document {
     readonly customAttributeRegistry: CustomAttributeRegistry | null;
+    createAttribute(localName: string, options?: AttributeCreationOptions): Attr;
+    createAttributeNS(
+      namespace: string | null,
+      qualifiedName: string,
+      options?: AttributeCreationOptions,
+    ): Attr;
   }
   interface ShadowRoot {
     readonly customAttributeRegistry: CustomAttributeRegistry | null;
@@ -40,16 +46,13 @@ declare global {
   interface ElementCreationOptions {
     customAttributeRegistry?: CustomAttributeRegistry | null;
   }
+  interface AttributeCreationOptions {
+    customAttributeRegistry?: CustomAttributeRegistry | null;
+  }
   interface ImportNodeOptions {
     customAttributeRegistry?: CustomAttributeRegistry;
   }
   interface ShadowRootInit {
     customAttributeRegistry?: CustomAttributeRegistry | null;
-  }
-  interface SetHTMLOptions {
-    customAttributeRegistry?: CustomAttributeRegistry;
-  }
-  interface SetHTMLUnsafeOptions {
-    customAttributeRegistry?: CustomAttributeRegistry;
   }
 }
